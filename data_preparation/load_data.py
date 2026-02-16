@@ -306,8 +306,8 @@ def analyze_enrolment_growth():
 
     return growth_df
 
-df = pd.read_csv("data/processed/master_longitudinal.csv", low_memory=False)
-pd.Series(sorted(df.columns)).to_csv("master_columns_list.csv", index=False)
+#df = pd.read_csv("data/processed/master_longitudinal.csv", low_memory=False)
+#pd.Series(sorted(df.columns)).to_csv("master_columns_list.csv", index=False)
 
 
 
