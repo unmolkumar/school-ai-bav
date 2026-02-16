@@ -191,10 +191,14 @@ def _build_infra_record(row):
 
 
 def _build_teacher_record(row):
+    # Schema drift: total_tch (2022-23+) supersedes total_teacher (2018-22)
+    teacher_count = _safe_int(_get(row, "total_tch"))
+    if teacher_count is None:
+        teacher_count = _safe_int(_get(row, "total_teacher"))
     return {
         "school_id":        str(row["school_id"]),
         "academic_year":    _safe_str(_get(row, TEACHER_MAP["academic_year"]), 20),
-        "total_teachers":   _safe_int(_get(row, TEACHER_MAP["total_teachers"])),
+        "total_teachers":   teacher_count,
         "required_teachers": None,
     }
 

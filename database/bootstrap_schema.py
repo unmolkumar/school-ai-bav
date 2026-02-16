@@ -76,6 +76,7 @@ infrastructure_details = Table(
     Column("total_class_rooms", Integer),
     Column("usable_class_rooms", Integer),
     Column("required_class_rooms", Integer),
+    Column("classroom_gap", Integer),
     Column("classroom_condition_score", Integer),
     # ── Basic Facilities
     Column("drinking_water_available", Boolean),
@@ -100,6 +101,7 @@ teacher_metrics = Table(
     Column("academic_year", String(20)),
     Column("total_teachers", Integer),
     Column("required_teachers", Integer),
+    Column("teacher_gap", Integer),
 )
 
 # ── Create tables & confirm ──────────────────────────────────────────────────

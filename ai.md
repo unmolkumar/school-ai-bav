@@ -1207,3 +1207,334 @@ Requires `DATABASE_URL` in `.env`.
 ✔ Batch inserts in single transaction
 ✔ Idempotent — safe to re-run
 ✔ Ready for production data load
+
+---
+
+========================================================
+Phase 2 – Infrastructure Gap Engine (Samagra Shiksha Norm-Based)
+========================================================
+
+### Andhra Pradesh Samagra Shiksha Classroom Norms
+
+The Department of School Education, Andhra Pradesh, follows the
+Samagra Shiksha Abhiyaan classroom adequacy norms. These prescribe
+maximum students per classroom by school level:
+
+| Level            | Classes | Norm (students/classroom) |
+| ---------------- | ------- | ------------------------- |
+| Primary          | 1–5     | 30                        |
+| Upper Primary    | 6–8     | 35                        |
+| Secondary        | 9–10    | 40                        |
+| Senior Secondary | 11–12   | 40                        |
+
+### How Norms Vary by School Category (UDISE+ Codes)
+
+Schools in the UDISE+ dataset carry a numeric `school_category` code.
+Each code maps to a class range. Where a school spans multiple levels
+(e.g., Category 2 = Classes 1–8), grade-wise enrolment breakdowns are
+not available in the current dataset. In such cases a **conservative
+blended norm of 30** (the strictest applicable standard) is applied to
+avoid underestimating classroom requirements.
+
+| UDISE+ Code | Structure                                | Norm Applied |
+| ----------- | ---------------------------------------- | ------------ |
+| 1           | Primary (1–5)                            | 30           |
+| 2           | Primary + Upper Primary (1–8)            | 30 (blended) |
+| 3           | Primary to Higher Secondary (1–12)       | 30 (blended) |
+| 4           | Upper Primary only (5–8)                 | 35           |
+| 5           | Upper Primary to Higher Secondary (6–12) | 35           |
+| 6           | Primary to Secondary (1–10)              | 30 (blended) |
+| 7           | Upper Primary to Secondary (6–10)        | 35           |
+| 8           | Secondary only (9–10)                    | 40           |
+| 10          | Secondary to Higher Secondary (9–12)     | 40           |
+| 11          | Higher Secondary only (11–12)            | 40           |
+
+**Blended norm assumption:**
+When a school spans primary and higher levels, grade-wise enrolment
+splits are not separately available. The conservative norm of 30 is
+used to ensure no school is incorrectly classified as having surplus
+classrooms. This assumption is documented here and can be refined
+when grade-wise data becomes available.
+
+### Computation Logic
+
+```
+required_class_rooms = ceil(total_enrolment / norm)
+classroom_gap = max(required_class_rooms - usable_class_rooms, 0)
+```
+
+- `usable_class_rooms` is sourced from `classrooms_in_good_condition`
+  (loaded in Phase 1.2).
+- If `usable_class_rooms` is NULL, the full `required_class_rooms`
+  is treated as the gap.
+- Surplus classrooms are recorded as gap = 0 (not negative).
+
+### Why Norm-Based Gap Estimation Is Critical for BAV
+
+The BAV system must validate whether a school's infrastructure
+proposal is justified. Without a norm-based baseline, there is no
+objective reference to compare against. This engine provides that
+baseline:
+
+- **Gap = 0** → School meets classroom adequacy norms.
+- **Gap > 0** → School has a quantified deficit that justifies a
+  classroom construction request.
+- **Large gap** → High-priority candidate for infrastructure funding.
+
+### How This Enables Evidence-Based Prioritisation
+
+1. **District-level ranking** — Aggregate `classroom_gap` by district
+   to identify the most under-resourced regions.
+2. **Block-level drill-down** — Same aggregation at block level for
+   targeted allocation.
+3. **Year-over-year tracking** — Gaps are computed per academic year,
+   enabling trend analysis (are gaps widening or closing?).
+4. **Proposal cross-validation** — When a school requests 10 new
+   classrooms but the computed gap is 3, the request can be flagged
+   for review.
+
+### Alignment with Department of School Education Guidelines
+
+This implementation directly supports the Department of School
+Education's mandate under Samagra Shiksha to ensure:
+
+- Every school meets minimum classroom adequacy standards.
+- Infrastructure investment is directed where deficits are greatest.
+- Proposals are validated against objective, reproducible metrics.
+- Progress is measurable year over year.
+
+### Script Location
+
+`engines/infrastructure_gap_engine.py`
+
+Requires `DATABASE_URL` in `.env`.
+
+### Schema Update
+
+`classroom_gap` (INT) column added to `infrastructure_details` via
+ALTER TABLE IF NOT EXISTS logic in the engine, and also added to
+`database/bootstrap_schema.py` for new deployments.
+
+### Current Status
+
+✔ Samagra Shiksha norms implemented for all 10 UDISE+ categories
+✔ Conservative blended norm (30) used where grade-wise data unavailable
+✔ required_class_rooms and classroom_gap computed and stored
+✔ Top-10 district deficit ranking generated
+✔ Idempotent — safe to re-run
+✔ Transaction-wrapped batch updates
+✔ Production-ready and scalable across 60,000+ schools
+
+---
+
+========================================================
+Phase 2 Optimization – Indexing for Scalable Joins
+========================================================
+
+### Why Composite Indexes Are Required
+
+The infrastructure gap engine performs a three-table JOIN
+(`infrastructure_details` ↔ `yearly_metrics` ↔ `schools`) during its
+bulk UPDATE. Without indexes, MySQL must execute full table scans on
+each table for every join condition, comparing every row against every
+other row.
+
+With 437,000+ rows in each fact table, an un-indexed join produces
+hundreds of billions of comparisons. Composite indexes on the join
+keys allow MySQL to use B-tree lookups instead, reducing the operation
+from $O(n^2)$ to $O(n \log n)$.
+
+### Indexes Created
+
+| Index Name               | Table                    | Columns                      | Purpose                                        |
+| ------------------------ | ------------------------ | ---------------------------- | ---------------------------------------------- |
+| `idx_infra_school_year`  | `infrastructure_details` | `(school_id, academic_year)` | Accelerates JOIN with `yearly_metrics`         |
+| `idx_yearly_school_year` | `yearly_metrics`         | `(school_id, academic_year)` | Accelerates JOIN with `infrastructure_details` |
+| `idx_schools_school_id`  | `schools`                | `(school_id)`                | Accelerates JOIN to dimension table            |
+
+All indexes are created with safe execution — if an index already
+exists, the error is caught and the engine continues. This preserves
+idempotent behavior.
+
+### Why JOIN Performance Degrades Without Indexing
+
+MySQL's query optimizer cannot use an efficient join strategy (e.g.,
+nested-loop with index lookup or hash join) when no index covers the
+join columns. The result is:
+
+- **Full table scans** on both sides of the join.
+- **Temporary tables** spilled to disk for intermediate results.
+- **Query time** scaling quadratically with row count.
+
+For the BAV system's current dataset (~437k rows per fact table),
+an un-indexed bulk UPDATE can take minutes. With indexes, the same
+operation completes in seconds.
+
+### Scalability to Millions of Rows
+
+As additional years of UDISE+ data are ingested (or if the system is
+extended to other states), row counts will grow into the millions.
+Composite indexes ensure that:
+
+- The bulk UPDATE remains $O(n \log n)$.
+- Summary aggregation queries (`GROUP BY district`) use indexed
+  lookups rather than full scans.
+- The engine remains production-viable without architectural changes.
+
+### No Business Logic Changed
+
+This optimization is purely structural. The Samagra Shiksha classroom
+norms, `required_class_rooms` calculation, `classroom_gap` formula,
+idempotent behavior, and all output formats remain identical to
+Phase 2.
+
+### Current Status
+
+✔ Three performance indexes added (safe / idempotent creation)
+✔ Bulk UPDATE execution time logged
+✔ No business logic modified
+✔ Engine scalable to millions of rows
+
+---
+
+========================================================
+Phase 3 – Teacher Adequacy Engine (Samagra Shiksha PTR Norms)
+========================================================
+
+### Official Pupil-Teacher Ratio (PTR) Norms
+
+The Teacher Adequacy Engine uses PTR norms mandated under Indian
+education policy as implemented by the Andhra Pradesh Department of
+School Education under the Samagra Shiksha Abhiyaan.
+
+**Policy Sources:**
+
+1. **Right to Education Act, 2009** — Section 25 read with the
+   Schedule prescribes maximum PTR for elementary schools:
+   - Primary (Classes 1–5): PTR ≤ 30:1
+   - Upper Primary (Classes 6–8): PTR ≤ 35:1
+     (with subject-specific teachers required)
+
+2. **Samagra Shiksha Framework for Implementation (MHRD, 2018)** —
+   The integrated framework merges SSA, RMSA, and Teacher Education
+   schemes. It inherits the RTE norms for elementary and the RMSA
+   norms for secondary and senior secondary levels.
+
+3. **Rashtriya Madhyamik Shiksha Abhiyan (RMSA) Framework** —
+   Prescribes PTR ≤ 30:1 for secondary schools (Classes 9–10),
+   with a minimum staffing of 1 Head Master + 5 subject teachers.
+
+4. **AP Department of School Education** — The state implements
+   central Samagra Shiksha PTR norms for teacher adequacy
+   assessment across all government and aided schools.
+
+### PTR Norms by Level
+
+| Level            | Classes | PTR Norm | Source          |
+| ---------------- | ------- | -------- | --------------- |
+| Primary          | 1–5     | 30:1     | RTE Act, 2009   |
+| Upper Primary    | 6–8     | 35:1     | RTE Act, 2009   |
+| Secondary        | 9–10    | 30:1     | RMSA / Samagra  |
+| Senior Secondary | 11–12   | 30:1     | Samagra Shiksha |
+
+### How PTR Norms Map to UDISE+ School Categories
+
+| UDISE+ Code | Structure                                | PTR Applied | Rationale                     |
+| ----------- | ---------------------------------------- | ----------- | ----------------------------- |
+| 1           | Primary (1–5)                            | 30          | Pure primary — RTE norm       |
+| 2           | Primary + Upper Primary (1–8)            | 30          | Blended — conservative        |
+| 3           | Primary to Higher Secondary (1–12)       | 30          | Blended — conservative        |
+| 4           | Upper Primary only (5–8)                 | 35          | Pure upper primary — RTE norm |
+| 5           | Upper Primary to Higher Secondary (6–12) | 30          | Blended — conservative        |
+| 6           | Primary to Secondary (1–10)              | 30          | Blended — conservative        |
+| 7           | Upper Primary to Secondary (6–10)        | 30          | Blended — conservative        |
+| 8           | Secondary only (9–10)                    | 30          | Pure secondary — RMSA norm    |
+| 10          | Secondary to Higher Secondary (9–12)     | 30          | Pure secondary/SS — RMSA      |
+| 11          | Higher Secondary only (11–12)            | 30          | Pure SS — Samagra Shiksha     |
+
+### Handling of Multi-Category (Blended) Schools
+
+When a school spans multiple levels (e.g., Category 2 = Classes 1–8),
+grade-wise enrolment breakdowns are not available in the current
+dataset. In such cases the **conservative PTR of 30** (the stricter
+standard) is applied. A lower PTR demands more teachers per student,
+ensuring no school is incorrectly classified as having adequate
+staffing.
+
+Only **Category 4** (pure upper primary, Classes 5–8) receives the
+higher PTR of 35:1, because all enrolled students fall exclusively
+within the upper primary level where the RTE Act explicitly permits
+this ratio due to subject-specialist staffing.
+
+### Computation Logic
+
+```
+required_teachers = CEIL(total_enrolment / PTR_norm)
+teacher_gap       = GREATEST(required_teachers - total_teachers, 0)
+```
+
+- `total_enrolment` is sourced from `yearly_metrics`.
+- `total_teachers` is sourced from `teacher_metrics` (loaded in Phase 1.2).
+- If `total_teachers` is NULL, the full `required_teachers` is treated
+  as the gap.
+- Surplus teachers are recorded as gap = 0 (not negative).
+
+### Batched Execution Strategy
+
+The engine batches the bulk UPDATE by academic year, executing one
+UPDATE per year (~63k rows each). This prevents Railway MySQL from
+timing out on large single-statement transactions and keeps each
+commit boundary small.
+
+Pattern:
+
+```
+for each academic_year:
+    UPDATE teacher_metrics t
+    JOIN yearly_metrics y ON ...
+    JOIN schools s ON ...
+    SET t.required_teachers = CEIL(y.total_enrolment / PTR_CASE),
+        t.teacher_gap = GREATEST(CEIL(...) - IFNULL(t.total_teachers, 0), 0)
+    WHERE t.academic_year = :year
+```
+
+### Indexing
+
+A new composite index is created on `teacher_metrics`:
+
+| Index Name                | Table             | Columns                      |
+| ------------------------- | ----------------- | ---------------------------- |
+| `idx_teacher_school_year` | `teacher_metrics` | `(school_id, academic_year)` |
+
+Existing indexes from Phase 2 are reused:
+
+- `idx_yearly_school_year` on `yearly_metrics`
+- `idx_schools_school_id` on `schools`
+
+All index creation is idempotent (no failure if index already exists).
+
+### Scalability
+
+The engine performs zero row fetches into Python. All computation
+runs server-side inside MySQL. The batched-per-year approach keeps
+each transaction at ~63k rows, well within Railway connection limits.
+With indexes, the three-table JOIN operates at O(n log n). The
+engine scales to millions of rows without architectural changes.
+
+### Schema Update
+
+`teacher_gap` (INT) column added to `teacher_metrics` via
+ALTER TABLE logic in the engine, and also added to
+`database/bootstrap_schema.py` for new deployments.
+
+### Current Status
+
+✔ Samagra Shiksha PTR norms implemented for all 10 UDISE+ categories
+✔ Conservative blended PTR (30) used where grade-wise data unavailable
+✔ Only pure upper primary (Category 4) uses PTR 35
+✔ required_teachers and teacher_gap computed and stored
+✔ Top-10 district teacher-deficit ranking generated
+✔ Batched per academic year for Railway performance
+✔ New index on teacher_metrics + reuses Phase 2 indexes
+✔ Idempotent — safe to re-run
+✔ No Phase 2 business logic modified
