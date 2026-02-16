@@ -82,3 +82,35 @@ Phase 3 – Teacher Adequacy Engine (Samagra Shiksha PTR Norms)
 - Idempotent — safe to re-run
 - No Phase 2 business logic changed (infrastructure gap engine untouched)
 - Updated ai.md with Phase 3 documentation including PTR citations
+
+---
+
+Phase 4 – Composite Compliance Risk Engine
+
+- Implemented weighted composite risk_score formula:
+  risk_score = (0.45 × teacher_deficit_ratio) + (0.35 × classroom_deficit_ratio) + (0.20 × growth_scaled)
+- Weight justification:
+  - 0.45 teacher: RTE Act Section 25 identifies PTR as primary input quality
+  - 0.35 classroom: Samagra Shiksha infrastructure norms core capacity constraint
+  - 0.20 growth: lagging indicator for demand pressure / decline risk
+- Policy alignment: Samagra Shiksha Framework convergent planning mandate
+- Deficit ratios capped at 1.0 (prevents outlier distortion)
+- Growth capped at 0.50 (filters administrative artefacts)
+- Enrolment growth computed via SQL LAG() window function
+- Safe division using NULLIF to prevent divide-by-zero
+- Risk classification: LOW (0–0.20), MODERATE (0.21–0.50), HIGH (0.51–0.75), CRITICAL (>0.75)
+- Schema additions to infrastructure_details:
+  classroom_deficit_ratio FLOAT
+  teacher_deficit_ratio FLOAT
+  enrolment_growth_rate FLOAT
+  risk_score FLOAT
+  risk_level VARCHAR(20)
+- Three batched UPDATE passes per academic year:
+  1. Deficit ratios (JOIN teacher_metrics)
+  2. Growth rates (LAG() subquery from yearly_metrics)
+  3. Composite score + classification (self-UPDATE)
+- All computation server-side — no Python row loops
+- All four existing indexes reused (no new indexes needed)
+- Idempotent — safe to re-run; always overwrites computed columns
+- Phase 2 (classroom gap) and Phase 3 (teacher gap) logic unchanged
+- Updated ai.md with full policy justification and formula documentation

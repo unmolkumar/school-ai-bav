@@ -1538,3 +1538,178 @@ ALTER TABLE logic in the engine, and also added to
 ✔ New index on teacher_metrics + reuses Phase 2 indexes
 ✔ Idempotent — safe to re-run
 ✔ No Phase 2 business logic modified
+
+---
+
+========================================================
+Phase 4 — Composite Compliance Risk Engine
+========================================================
+
+### Policy Rationale
+
+The Samagra Shiksha Abhiyaan framework requires state-level education
+authorities to assess school readiness across multiple dimensions
+simultaneously — teacher adequacy, infrastructure capacity, and
+enrolment dynamics. Individual gap metrics (Phase 2: classroom gap,
+Phase 3: teacher gap) are necessary but insufficient for governance
+decision-making: a school may have adequate classrooms but critically
+few teachers, or vice versa. The Composite Compliance Risk Engine
+integrates these signals into a single, interpretable risk score that
+enables district- and state-level prioritisation.
+
+This approach aligns with the Samagra Shiksha Framework for
+Implementation (MHRD, 2018), which mandates integrated planning
+across teacher deployment (Chapter 5), civil works (Chapter 4), and
+enrolment monitoring (Chapter 3). The framework explicitly calls for
+"convergent planning" where resource allocation decisions consider
+multiple school-level indicators rather than isolated metrics.
+
+### Composite Risk Score Formula
+
+$$
+\text{risk\_score} = (0.45 \times \text{teacher\_deficit\_ratio}) + (0.35 \times \text{classroom\_deficit\_ratio}) + (0.20 \times \text{growth\_scaled})
+$$
+
+Where:
+
+$$
+\text{teacher\_deficit\_ratio} = \min\left(\frac{\text{teacher\_gap}}{\text{required\_teachers}}, 1.0\right)
+$$
+
+$$
+\text{classroom\_deficit\_ratio} = \min\left(\frac{\text{classroom\_gap}}{\text{required\_class\_rooms}}, 1.0\right)
+$$
+
+$$
+\text{enrolment\_growth\_rate} = \frac{\text{current\_enrolment} - \text{previous\_enrolment}}{\text{previous\_enrolment}} \quad \text{(via SQL LAG())}
+$$
+
+$$
+\text{growth\_scaled} = \min(|\text{enrolment\_growth\_rate}|, 0.50)
+$$
+
+### Weight Justification (0.45 / 0.35 / 0.20)
+
+| Weight | Component               | Justification                                                                                                                                                                                                                                                                                                                                                                    |
+| ------ | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.45   | Teacher deficit ratio   | The RTE Act, 2009 identifies teacher adequacy (Section 25) as the primary input quality determinant. Empirical education research consistently shows PTR as the strongest predictor of learning outcomes in government schools. Teacher shortage directly impacts instructional hours and pedagogical quality.                                                                   |
+| 0.35   | Classroom deficit ratio | Samagra Shiksha infrastructure norms treat classroom capacity as the core physical constraint. Overcrowded classrooms degrade learning environments and violate the RTE Act's stipulation of adequate space. Ranked second because temporary arrangements (shift systems) can partially mitigate classroom shortfalls, whereas teacher shortfalls have no equivalent workaround. |
+| 0.20   | Enrolment growth (abs)  | Enrolment trajectory is a lagging indicator — it reflects emerging demand pressure (positive growth) or institutional decline risk (negative growth). Weighted lowest because it signals future risk rather than current non-compliance. The absolute value ensures both rapid growth (overcrowding risk) and rapid decline (closure risk) contribute to the risk assessment.    |
+
+### Why Deficit Ratios Are Capped at 1.0
+
+A school missing 10 teachers out of 5 required has a raw ratio of 2.0,
+but in governance terms the school is fully non-compliant regardless of
+whether the ratio is 1.0 or 5.0. Capping at 1.0 prevents extreme
+outliers from distorting the composite score and ensures the weighted
+sum remains in the interpretable [0, 1] range.
+
+### Why Growth Is Capped at 0.50
+
+Enrolment changes exceeding 50% year-over-year typically reflect
+administrative events (school mergers, boundary redistricting, data
+corrections) rather than organic demand shifts. Capping at 0.50
+prevents these administrative artefacts from overwhelming the
+composite score while preserving the signal from genuine growth or
+decline trends.
+
+### Safe Division
+
+All division uses `NULLIF(denominator, 0)` to return NULL instead of
+raising a division-by-zero error. `IFNULL(..., 0)` wraps the result
+so that schools with zero requirements receive a deficit ratio of 0.
+
+### Enrolment Growth via LAG()
+
+Growth rate is computed using the SQL `LAG()` window function:
+
+```sql
+LAG(total_enrolment) OVER (
+    PARTITION BY school_id ORDER BY academic_year
+) AS prev_enrolment
+```
+
+For the first year of a school's record (no previous year exists),
+`prev_enrolment` is NULL and `enrolment_growth_rate` defaults to 0.
+This avoids penalising new schools for missing historical data.
+
+### Risk Classification
+
+| Score Range | Risk Level | Governance Interpretation                                   |
+| ----------- | ---------- | ----------------------------------------------------------- |
+| 0.00–0.20   | LOW        | School meets or nearly meets norms; routine monitoring only |
+| 0.21–0.50   | MODERATE   | Partial compliance gaps; scheduled intervention recommended |
+| 0.51–0.75   | HIGH       | Significant deficits; priority resource allocation required |
+| > 0.75      | CRITICAL   | Severe multi-dimensional non-compliance; immediate action   |
+
+These thresholds align with standard risk-stratification practice in
+public administration. The CRITICAL tier (>0.75) identifies schools
+where both teacher and infrastructure deficits are simultaneously
+severe — precisely the population that Samagra Shiksha convergent
+planning is designed to address.
+
+### Schema Additions
+
+Five columns added to `infrastructure_details` via ALTER TABLE:
+
+| Column                    | Type        | Source                                           |
+| ------------------------- | ----------- | ------------------------------------------------ |
+| `classroom_deficit_ratio` | FLOAT       | classroom_gap / required_class_rooms, capped 1.0 |
+| `teacher_deficit_ratio`   | FLOAT       | teacher_gap / required_teachers, capped 1.0      |
+| `enrolment_growth_rate`   | FLOAT       | LAG()-based YoY growth from yearly_metrics       |
+| `risk_score`              | FLOAT       | Weighted composite (0.45 + 0.35 + 0.20)          |
+| `risk_level`              | VARCHAR(20) | CASE-classified: LOW/MODERATE/HIGH/CRITICAL      |
+
+### Batched Execution Strategy
+
+The engine executes three batched UPDATE passes per academic year:
+
+1. **Deficit ratios** — JOIN infrastructure_details ↔ teacher_metrics
+   to compute both deficit ratios in a single UPDATE.
+2. **Growth rate** — JOIN infrastructure_details ↔ derived LAG()
+   subquery from yearly_metrics.
+3. **Risk score + level** — Pure self-UPDATE on infrastructure_details
+   using the ratios computed in passes 1–2.
+
+Each pass is batched by `WHERE academic_year = :year` (~63k rows per
+batch), preventing Railway MySQL from timing out.
+
+### Indexing
+
+All four existing indexes are reused:
+
+| Index Name                | Table                    | Purpose                        |
+| ------------------------- | ------------------------ | ------------------------------ |
+| `idx_infra_school_year`   | `infrastructure_details` | Target table + JOIN key        |
+| `idx_teacher_school_year` | `teacher_metrics`        | JOIN for teacher_deficit_ratio |
+| `idx_yearly_school_year`  | `yearly_metrics`         | LAG() subquery scan            |
+| `idx_schools_school_id`   | `schools`                | District lookup in summary     |
+
+### Scalability
+
+All computation runs server-side inside MySQL. Zero rows are fetched
+into Python. Three UPDATE passes × 7 years = 21 batched transactions,
+each processing ~63k rows. With composite indexes, every JOIN operates
+at O(n log n). The engine scales to millions of rows without
+architectural changes.
+
+### Script Location
+
+`engines/compliance_risk_engine.py`
+
+Requires `DATABASE_URL` in `.env`.
+Depends on Phase 2 (classroom_gap) and Phase 3 (teacher_gap) being
+run first.
+
+### Current Status
+
+✔ Composite risk formula implemented (0.45 / 0.35 / 0.20)
+✔ Deficit ratios capped at 1.0 with safe division
+✔ Enrolment growth via LAG() with NULL-safe defaults
+✔ Growth capped at 0.50 to filter administrative noise
+✔ Four-tier risk classification (LOW / MODERATE / HIGH / CRITICAL)
+✔ Five new columns added to infrastructure_details
+✔ Three batched UPDATE passes per academic year
+✔ All existing indexes reused
+✔ Idempotent — safe to re-run
+✔ No Phase 2 or Phase 3 business logic modified
