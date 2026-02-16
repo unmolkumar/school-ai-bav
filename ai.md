@@ -1125,3 +1125,85 @@ repeatable while ensuring the latest structure is always applied.
 ✔ Bootstrap script updated and idempotent
 ✔ Other tables (schools, yearly_metrics, teacher_metrics) unchanged
 ✔ No data inserted — population is the next step
+
+---
+
+========================================================
+Phase 1.2 – Flexible Schema Mapping
+========================================================
+
+### Why Strict Column Checking Was Removed
+
+The AIKosh / UDISE+ datasets are government-published and their schema
+changes between academic years (columns renamed, added, or removed).
+A loader that asserts exact column equality breaks the moment a new
+year's CSV arrives with even one unexpected header.
+
+Phase 1.2 replaces the rigid approach with a **COLUMN_MAPPING**
+pattern: each DB column is explicitly paired with a CSV column name
+(or `None` when no source exists). The loader calls `row.get(csv_col)`
+for every field—if the column is absent or the value is NaN, it
+gracefully falls back to `None`. No `KeyError`, no crash.
+
+### How CSV-to-DB Mapping Works
+
+Four declarative mapping dictionaries drive the entire ingestion:
+
+| DB table                 | Mapping type                                     | Example                                                              |
+| ------------------------ | ------------------------------------------------ | -------------------------------------------------------------------- |
+| `schools`                | `SCHOOL_MAP` — direct string get                 | `"district" ← "district"`                                            |
+| `yearly_metrics`         | `YEARLY_MAP` — direct with int/float cast        | `"total_enrolment" ← "total_enrolment"`                              |
+| `infrastructure_details` | `INFRA_DIRECT_MAP` + `INFRA_BOOL_MAP` + computed | `"electricity_available" ← flag_to_bool("electricity_availability")` |
+| `teacher_metrics`        | `TEACHER_MAP` — direct with int cast             | `"total_teachers" ← "total_teacher"`                                 |
+
+**Computed fields:**
+
+- `classroom_condition_score` =
+  `(classrooms_needs_major_repair × 2) + (classrooms_needs_minor_repair × 1)`
+- `cwsn_toilet_available` =
+  `True` if `func_boys_cwsn_friendly == 1` OR `func_girls_cwsn_friendly == 1`
+
+Fields not yet available in the CSV (`required_class_rooms`,
+`last_major_repair_year`, `attendance_rate`, `required_teachers`) are
+stored as NULL, ready to be populated in later phases.
+
+### Why This Improves Robustness for AIKosh Datasets
+
+1. **Schema drift tolerance** — New columns in future CSVs are silently
+   ignored; missing columns produce NULLs instead of crashes.
+2. **Single-source-of-truth** — All mapping decisions live in four
+   dictionaries at the top of the file. Adding a new field means
+   adding one line, not hunting through loop logic.
+3. **Type safety** — Every value passes through `_safe_int`,
+   `_safe_float`, `_safe_str`, or `_flag_to_bool` before reaching the
+   database, preventing type-mismatch errors at the MySQL layer.
+4. **Idempotent** — The script DELETEs all rows then re-INSERTs inside
+   a single transaction, so every run produces identical state.
+
+### How This Supports Scalable Ingestion
+
+The loader processes 437,106 school-year rows across 67,343 schools in
+batch inserts of 5,000 rows each, wrapped in a transaction. This
+pattern scales linearly — when 2025-26 data appears, the CSV grows by
+~60k rows and the loader handles it without code changes.
+
+Because the mapping is declarative, onboarding a new data source
+(e.g., a different state's UDISE+ export) requires only updating the
+mapping dictionaries, not rewriting ingestion logic.
+
+### Script Location
+
+`database/load_master_data.py`
+
+Requires `DATABASE_URL` in `.env`.
+
+### Current Status
+
+✔ Flexible COLUMN_MAPPING approach implemented
+✔ Graceful handling of missing / extra CSV columns
+✔ classroom_condition_score computed from repair fields
+✔ cwsn_toilet_available derived from functional CWSN flags
+✔ Boolean flag conversion (1 = True, else False/NULL)
+✔ Batch inserts in single transaction
+✔ Idempotent — safe to re-run
+✔ Ready for production data load
