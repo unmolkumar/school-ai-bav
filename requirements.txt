@@ -8,3 +8,5 @@ scikit-learn
 prophet
 matplotlib
 seaborn
+fastapi
+uvicorn[standard]

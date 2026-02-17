@@ -1713,3 +1713,714 @@ run first.
 ✔ All existing indexes reused
 ✔ Idempotent — safe to re-run
 ✔ No Phase 2 or Phase 3 business logic modified
+
+---
+
+# ======================================================== Phase 5 — SCHOOL PRIORITISATION ENGINE
+
+## Phase 5: School Prioritisation Engine
+
+### Purpose
+
+Converts raw risk scores (Phase 4) into actionable, policy-ready rankings
+at both state and district level. Enables governance teams to identify
+the most critical schools and allocate resources by priority tier.
+
+### Architecture
+
+Creates the `school_priority_index` table (one row per school per year).
+All computation is server-side SQL with RANK(), PERCENT_RANK(), and LAG()
+window functions. No Python row loops. Idempotent — safe to re-run.
+
+### Computed Columns
+
+| Column                      | Type        | Computation                                         |
+| --------------------------- | ----------- | --------------------------------------------------- |
+| `state_rank`                | INT         | RANK() OVER (ORDER BY risk_score DESC) per year     |
+| `district_rank`             | INT         | RANK() OVER (PARTITION BY district ...) per year    |
+| `priority_bucket`           | VARCHAR(20) | PERCENT_RANK → TOP_5 / TOP_10 / TOP_20 / STANDARD   |
+| `persistent_high_risk_flag` | TINYINT     | 1 if 3+ consecutive years at HIGH or CRITICAL level |
+
+### Priority Bucketing Logic
+
+| Percentile (risk_score DESC) | Bucket   | Governance Interpretation       |
+| ---------------------------- | -------- | ------------------------------- |
+| ≤ 5%                         | TOP_5    | Immediate intervention required |
+| ≤ 10%                        | TOP_10   | High-priority monitoring        |
+| ≤ 20%                        | TOP_20   | Scheduled review recommended    |
+| > 20%                        | STANDARD | Routine compliance monitoring   |
+
+### Persistent High-Risk Detection
+
+Uses LAG(risk_level, 1) and LAG(risk_level, 2) to check the current
+year and two preceding years. If all three are HIGH or CRITICAL, the
+flag is set to 1. This identifies chronically underperforming schools
+that require structural intervention rather than incremental fixes.
+
+### Indexing
+
+| Index Name                 | Table                 | Purpose            |
+| -------------------------- | --------------------- | ------------------ |
+| `idx_priority_school_year` | school_priority_index | Primary lookup key |
+
+### Verified Output (437,106 rows)
+
+- Top 5% : 22,195
+- Top 10% : 21,699
+- Top 20% : 44,029
+- Standard : 349,183
+- Persistent high-risk: 10,588
+
+Top districts: ASR (4,327 high-priority, 972 persistent),
+KURNOOL (4,136 high-priority, 1,511 persistent).
+
+### Script Location
+
+`engines/prioritisation_engine.py`
+
+### Current Status
+
+✔ State & district ranking via RANK() window functions
+✔ Priority bucketing via PERCENT_RANK() (TOP_5/TOP_10/TOP_20/STANDARD)
+✔ Persistent high-risk flag via LAG() (3+ consecutive HIGH/CRITICAL)
+✔ Batched per academic year (~63k rows/batch)
+✔ Composite index on (school_id, academic_year)
+✔ Idempotent — safe to re-run
+
+---
+
+# ======================================================== Phase 6 — BUDGET ALLOCATION SIMULATOR
+
+## Phase 6: Budget Allocation Simulator
+
+### Purpose
+
+Simulates priority-ordered allocation of limited classroom and teacher
+resources across all schools, enabling policy-makers to model the impact
+of different budget levels before committing real funds.
+
+### Architecture
+
+Creates the `budget_simulation` table. Seeds from infrastructure_details
+
+- teacher_metrics, ranks by risk_level priority (CRITICAL first), then
+  uses cumulative SUM() OVER() to determine allocation cutoff points.
+  All computation is server-side SQL. No Python row loops.
+
+### Allocation Algorithm
+
+1. **Seeding**: JOINs infrastructure_details × teacher_metrics × schools
+   per year. Each school gets its classroom_gap and teacher_gap.
+2. **Priority ordering**: ROW_NUMBER() with ORDER BY
+   CRITICAL → HIGH → MODERATE → LOW, then by gap magnitude DESC.
+3. **Cumulative allocation**: Cumulative SUM(classroom_gap) OVER
+   (ORDER BY allocation_priority). Schools within budget ceiling get
+   `classrooms_allocated = classroom_gap`. Same pattern for teachers.
+4. **Resolution tracking**: `classroom_resolved` / `teacher_resolved`
+   flags indicate whether the school's full deficit was covered.
+
+### Configuration Defaults
+
+| Parameter          | Default      | Derives                  |
+| ------------------ | ------------ | ------------------------ |
+| Classroom budget   | ₹500,000,000 | = 1,000 classrooms @ ₹5L |
+| Cost per classroom | ₹500,000     |                          |
+| Max classrooms     | 1,000        |                          |
+| Teacher posts      | 10,000       |                          |
+
+### Indexing
+
+| Index Name               | Table             | Purpose                      |
+| ------------------------ | ----------------- | ---------------------------- |
+| `idx_budget_school_year` | budget_simulation | Primary lookup key           |
+| `idx_budget_priority`    | budget_simulation | Allocation ordering per year |
+
+### Verified Output (437,106 rows)
+
+- Classrooms allocated: 7,000 (7 years × 1,000)
+- Teachers allocated: 70,000 (7 years × 10,000)
+- Schools classroom-resolved: 1,111
+- Schools teacher-resolved: 6,389
+- Remaining classroom deficit: 1,772,152
+- Remaining teacher deficit: 1,653,961
+
+### Script Location
+
+`engines/budget_allocation_engine.py`
+
+### Current Status
+
+✔ Priority-ordered allocation (CRITICAL → HIGH → MODERATE → LOW)
+✔ Cumulative window sum for budget cutoff
+✔ Configurable budget parameters
+✔ Resolution tracking per school
+✔ Batched per academic year
+✔ Idempotent — safe to re-run
+
+---
+
+# ======================================================== Phase 7 — LONGITUDINAL RISK TREND ENGINE
+
+## Phase 7: Longitudinal Risk Trend Engine
+
+### Purpose
+
+Tracks how each school's risk profile evolves over time. Identifies
+improving, stable, deteriorating, chronically-at-risk, and volatile
+schools — enabling proactive rather than reactive governance.
+
+### Architecture
+
+Creates the `risk_trend` table (one row per school per year).
+Inserts all years in a single pass to ensure LAG() windows operate
+across the full time series. Then computes chronic and volatile
+flags via batched UPDATE passes per year.
+
+### Computed Columns
+
+| Column                 | Type        | Computation                                        |
+| ---------------------- | ----------- | -------------------------------------------------- | ---------- | ------------------------------- |
+| `risk_delta`           | FLOAT       | current risk_score − LAG(risk_score, 1)            |
+| `prev_risk_score`      | FLOAT       | LAG(risk_score, 1) for reference                   |
+| `trend_direction`      | VARCHAR(20) | IMPROVING / STABLE / DETERIORATING / BASELINE      |
+| `year_over_year_count` | INT         | ROW_NUMBER() — sequential year index per school    |
+| `chronic_risk_flag`    | TINYINT     | 1 if 3+ consecutive years HIGH/CRITICAL            |
+| `volatile_flag`        | TINYINT     | 1 if                                               | risk_delta | > 0.25 in current or prior year |
+| `cumulative_avg_risk`  | FLOAT       | Running average of risk_score across all prior yrs |
+
+### Trend Classification
+
+| Condition         | Direction     | Governance Interpretation            |
+| ----------------- | ------------- | ------------------------------------ |
+| delta IS NULL     | BASELINE      | First year — no prior data           |
+| delta < −0.10     | IMPROVING     | Meaningful reduction in risk         |
+| abs(delta) ≤ 0.10 | STABLE        | No significant change                |
+| delta > +0.10     | DETERIORATING | Risk increasing — requires attention |
+
+### Chronic Risk Detection
+
+Uses LAG(risk_level, 1) and LAG(risk_level, 2) from infrastructure_details
+to check 3 consecutive years of HIGH or CRITICAL classification.
+Matches the persistent_high_risk_flag from Phase 5 for cross-validation.
+
+### Volatile Detection
+
+A school is flagged volatile if |risk_delta| > 0.25 in the current or
+previous transition. This catches schools with erratic risk profiles
+that may indicate data quality issues or rapid environmental changes.
+
+### Indexing
+
+| Index Name              | Table      | Purpose                          |
+| ----------------------- | ---------- | -------------------------------- |
+| `idx_trend_school_year` | risk_trend | Primary lookup key               |
+| `idx_trend_direction`   | risk_trend | Filter by year + trend direction |
+
+### Verified Output (437,106 rows)
+
+- BASELINE : 67,343 (first year — no prior data)
+- IMPROVING : 123,487 (delta < −0.10)
+- STABLE : 170,401 (abs(delta) ≤ 0.10)
+- DETERIORATING : 75,875 (delta > +0.10)
+- Chronic risk : 10,588 (3+ consecutive HIGH/CRITICAL)
+- Volatile : 160,357 (|delta| > 0.25 recent)
+- Mean cumulative avg risk: 0.3239
+
+### Script Location
+
+`engines/risk_trend_engine.py`
+
+### Current Status
+
+✔ Risk delta via LAG() across full time series
+✔ Trend classification (IMPROVING / STABLE / DETERIORATING / BASELINE)
+✔ Chronic risk flag (3+ consecutive HIGH/CRITICAL years)
+✔ Volatile flag (|delta| > 0.25 in recent transitions)
+✔ Running cumulative average risk per school
+✔ Full longitudinal INSERT (LAG correctness preserved)
+✔ Chronic + volatile flags batched per year
+✔ Idempotent — safe to re-run
+
+---
+
+# ======================================================== Phase 8 — DISTRICT COMPLIANCE INDEX
+
+## Phase 8: District Compliance Index
+
+### Purpose
+
+Aggregates school-level data up to the district level, producing a
+single compliance scorecard per district per academic year. Enables
+state-level monitoring and cross-district comparison.
+
+### Architecture
+
+Creates the `district_compliance_index` table (one row per district
+per year). Uses GROUP BY with aggregate functions (COUNT, AVG, SUM),
+then adds YoY improvement and district ranking via window functions
+in separate UPDATE passes.
+
+### Computed Columns
+
+| Column                    | Type       | Computation                                     |
+| ------------------------- | ---------- | ----------------------------------------------- |
+| `total_schools`           | INT        | COUNT(DISTINCT school_id) per district-year     |
+| `avg_risk_score`          | FLOAT      | AVG(risk_score) across district schools         |
+| `pct_high_critical`       | FLOAT      | % of schools rated HIGH or CRITICAL             |
+| `total_classroom_deficit` | INT        | SUM(classroom_gap) where gap > 0                |
+| `total_teacher_deficit`   | INT        | SUM(teacher_gap) where gap > 0                  |
+| `total_enrolment`         | BIGINT     | SUM(total_enrolment) from yearly_metrics        |
+| `avg_classroom_condition` | FLOAT      | AVG(classroom_condition_score)                  |
+| `yoy_risk_improvement`    | FLOAT      | LAG()-based change in avg_risk vs previous year |
+| `district_rank`           | INT        | RANK() by avg_risk_score DESC per year          |
+| `compliance_grade`        | VARCHAR(5) | A/B/C/D/F based on avg_risk thresholds          |
+
+### Compliance Grading
+
+| Avg Risk Score | Grade | Governance Interpretation            |
+| -------------- | ----- | ------------------------------------ |
+| ≤ 0.15         | A     | Meets norms comprehensively          |
+| ≤ 0.30         | B     | Minor gaps — scheduled maintenance   |
+| ≤ 0.50         | C     | Significant gaps — targeted action   |
+| ≤ 0.75         | D     | Major non-compliance — urgent review |
+| > 0.75         | F     | Systemic failure — structural reform |
+
+### Indexing
+
+| Index Name              | Table                     | Purpose               |
+| ----------------------- | ------------------------- | --------------------- |
+| `idx_dci_district_year` | district_compliance_index | Primary lookup key    |
+| `idx_dci_rank`          | district_compliance_index | Filter by year + rank |
+
+### Verified Output (182 records = 26 districts × 7 years)
+
+- Overall avg risk score: 0.3019
+- Avg % HIGH+CRITICAL: 19.23%
+- Grand classroom deficit: 1,779,152
+- Grand teacher deficit: 1,723,961
+- Compliance grades: B=96, C=86, A/D/F=0
+
+Top risk districts (2024-25): KURNOOL (#1, 0.3828, Grade C),
+ASR (#2, 0.3557, Grade C), NANDYAL (#3, 0.3153, Grade C).
+
+### Script Location
+
+`engines/district_compliance_engine.py`
+
+### Current Status
+
+✔ Full district-level aggregation (schools, risk, deficits, enrolment)
+✔ Compliance grading (A/B/C/D/F)
+✔ YoY risk improvement via LAG()
+✔ District ranking via RANK()
+✔ Batched per academic year
+✔ Idempotent — safe to re-run
+
+---
+
+# ======================================================== Phase 9 — PROPOSAL VALIDATION ENGINE
+
+## Phase 9: Proposal Validation Engine
+
+### Purpose
+
+Validates school demand proposals (classroom and teacher requests) against
+actual computed infrastructure and teacher gaps. Provides automated
+decision support (ACCEPTED / FLAGGED / REJECTED) with confidence scores,
+enabling governance teams to rapidly approve or challenge demand plans.
+
+### Architecture
+
+Creates two tables:
+
+- `school_demand_proposals` — synthetic input proposals (with noise)
+- `proposal_validations` — validated output with decisions
+
+Proposals are generated using CRC32-based deterministic noise (±30%
+around actual gap) to simulate realistic over/under-requesting.
+Validation uses SQL CASE logic comparing requested amounts against
+actual gaps.
+
+### Decision Logic
+
+| Condition                             | Decision | Reason Code            |
+| ------------------------------------- | -------- | ---------------------- |
+| No deficit but requesting resources   | REJECTED | NO_DEFICIT             |
+| Request > 1.5× actual gap (classroom) | REJECTED | CLASSROOM_OVER_REQUEST |
+| Request > 1.5× actual gap (teacher)   | REJECTED | TEACHER_OVER_REQUEST   |
+| Request 1.2–1.5× actual gap           | FLAGGED  | \*\_MODERATE_OVER      |
+| Request < 0.5× actual gap             | FLAGGED  | \*\_UNDER_REQUEST      |
+| No request and no gap                 | ACCEPTED | NO_REQUEST             |
+| Within ±20% tolerance                 | ACCEPTED | WITHIN_TOLERANCE       |
+
+### Confidence Score
+
+Confidence = max(0, 1.0 − (|1 − classroom_ratio| + |1 − teacher_ratio|) / 2)
+
+A perfect match (ratio = 1.0) yields confidence = 1.0. Deviations
+reduce confidence proportionally.
+
+### Proposal Generation (Simulation)
+
+Uses CRC32(CONCAT(school_id, academic_year, suffix)) to generate
+deterministic pseudo-random noise factors between 0.7 and 1.5.
+This ensures:
+
+- Reproducibility across runs
+- Realistic distribution of over/under-requesting
+- No random() dependency or external data needed
+
+### Indexing
+
+| Index Name                    | Table                   | Purpose               |
+| ----------------------------- | ----------------------- | --------------------- |
+| `idx_proposals_school_year`   | school_demand_proposals | Primary lookup        |
+| `idx_validations_school_year` | proposal_validations    | Primary lookup        |
+| `idx_validations_decision`    | proposal_validations    | Filter by year+status |
+
+### Verified Output (437,106 proposals)
+
+- ACCEPTED : 325,758
+- FLAGGED : 111,348
+- REJECTED : 0
+- Avg confidence: 0.916
+
+Reason breakdown: WITHIN_TOLERANCE=200,608, NO_REQUEST=125,150.
+
+### Script Location
+
+`engines/proposal_validation_engine.py`
+
+### Current Status
+
+✔ Synthetic proposal generation via CRC32 deterministic noise
+✔ Multi-dimensional validation (classroom + teacher)
+✔ Three-tier decision (ACCEPTED / FLAGGED / REJECTED)
+✔ Confidence scoring with ratio-based formula
+✔ Reason codes for governance audit trail
+✔ Batched per academic year
+✔ Idempotent — safe to re-run
+
+---
+
+# ======================================================== Phase 10 — ENROLMENT FORECASTING ENGINE
+
+## Phase 10: Enrolment Forecasting Engine
+
+### Purpose
+
+Projects future enrolment, classroom requirements, and teacher
+requirements for each school using weighted moving-average growth
+trends. Generates 3-year forward projections (T+1, T+2, T+3) from
+the latest available year, enabling proactive capacity planning.
+
+### Architecture
+
+Creates the `enrolment_forecast` table (3 rows per school — one per
+forecast year). Uses a single INSERT...SELECT with CROSS JOIN to
+generate all 3 horizons simultaneously. Growth rates computed via
+LAG() across the full time series before filtering to latest year.
+
+### Growth Rate Computation
+
+Weighted moving average of 3 most recent YoY growth rates:
+
+growth = (3 × delta_1 + 2 × delta_2 + 1 × delta_3) / (6 × E_prev)
+
+Where delta_k is the absolute enrolment change k years ago and
+E_prev is the prior year's enrolment. Weights (3, 2, 1) give more
+influence to recent trends.
+
+Growth is capped at ±0.30 to prevent wild projections from
+administrative anomalies (mergers, boundary changes).
+
+### Projection Formula
+
+E(t+n) = E(t) × (1 + g_hat)^n
+
+Where g_hat is the capped growth rate and n is in {1, 2, 3}.
+
+### UDISE+ Norms Applied
+
+| School Category | Classroom Norm (students/room) | PTR Norm (students/teacher) |
+| --------------- | ------------------------------ | --------------------------- |
+| 1, 2, 3         | 30                             | 30                          |
+| 4, 5            | 35                             | 30                          |
+| 6, 7, 8, 10, 11 | 40                             | 35                          |
+
+### Computed Columns
+
+| Column                     | Type  | Computation                         |
+| -------------------------- | ----- | ----------------------------------- |
+| `base_enrolment`           | INT   | Enrolment in the latest year        |
+| `avg_growth_rate`          | FLOAT | Weighted 3-year moving average      |
+| `projected_enrolment`      | INT   | base × (1 + growth)^years_ahead     |
+| `projected_classrooms_req` | INT   | CEILING(projected_enrolment / norm) |
+| `projected_teachers_req`   | INT   | CEILING(projected_enrolment / PTR)  |
+| `projected_classroom_gap`  | INT   | GREATEST(0, required − current)     |
+| `projected_teacher_gap`    | INT   | GREATEST(0, required − current)     |
+
+### Indexing
+
+| Index Name            | Table              | Purpose                    |
+| --------------------- | ------------------ | -------------------------- |
+| `idx_forecast_school` | enrolment_forecast | Primary lookup key         |
+| `idx_forecast_year`   | enrolment_forecast | Filter by forecast horizon |
+
+### Verified Output (183,951 rows = 61,317 schools × 3 horizons)
+
+- Base year: 2024-25
+- Forecast range: 2025-26 → 2027-28
+- Mean growth rate: −0.1469 (overall declining enrolment — realistic for AP)
+- Avg projected enrolment: 271
+
+Projected Classroom Deficit by Horizon:
+
+- T+1: 200,719
+- T+2: 218,586
+- T+3: 247,764
+
+Projected Teacher Deficit by Horizon:
+
+- T+1: 209,829
+- T+2: 232,862
+- T+3: 268,040
+
+Top deficit district (T+3): KURNOOL (cr_gap 18,541, tr_gap 20,100).
+
+### Script Location
+
+`engines/forecasting_engine.py`
+
+### Current Status
+
+✔ Weighted 3-year moving average growth rate
+✔ LAG() across full time series (correct longitudinal window)
+✔ 3-year forward projection (T+1, T+2, T+3)
+✔ UDISE+ category-based classroom and PTR norms
+✔ Growth capped at ±0.30 to filter anomalies
+✔ Projected deficit computation against current capacity
+✔ CROSS JOIN for efficient multi-horizon generation
+✔ Idempotent — safe to re-run
+
+---
+
+# ======================================================== COMPLETE SYSTEM ARCHITECTURE
+
+## System Architecture Summary (Phases 1-10)
+
+### Execution Order and Dependencies
+
+```
+Phase 1: Schema Bootstrap           → Creates all tables
+Phase 2: Infrastructure Gap Engine  → classroom_gap (requires Phase 1)
+Phase 3: Teacher Adequacy Engine    → teacher_gap   (requires Phase 1)
+Phase 4: Compliance Risk Engine     → risk_score    (requires Phases 2, 3)
+Phase 5: Prioritisation Engine      → rankings      (requires Phase 4)
+Phase 6: Budget Allocation Simulator → allocation   (requires Phases 2, 3, 4)
+Phase 7: Risk Trend Engine          → trend/chronic  (requires Phase 4)
+Phase 8: District Compliance Index  → district agg   (requires Phases 2, 3, 4)
+Phase 9: Proposal Validation Engine → decisions      (requires Phases 2, 3)
+Phase 10: Forecasting Engine        → projections    (requires Phase 1 data)
+```
+
+### Database Tables (11 total)
+
+| Table                       | Phase | Rows  | Description                     |
+| --------------------------- | ----- | ----- | ------------------------------- |
+| `schools`                   | 1     | ~63k  | Static school master data       |
+| `infrastructure_details`    | 1,2,4 | ~437k | Infrastructure + computed risk  |
+| `teacher_metrics`           | 1,3   | ~437k | Teacher counts + computed gap   |
+| `yearly_metrics`            | 1     | ~437k | Enrolment and attendance        |
+| `school_priority_index`     | 5     | ~437k | Rankings + priority buckets     |
+| `budget_simulation`         | 6     | ~437k | Resource allocation simulation  |
+| `risk_trend`                | 7     | ~437k | Longitudinal risk tracking      |
+| `district_compliance_index` | 8     | ~182  | District-level compliance cards |
+| `school_demand_proposals`   | 9     | ~437k | Simulated demand proposals      |
+| `proposal_validations`      | 9     | ~437k | Validated proposals + decisions |
+| `enrolment_forecast`        | 10    | ~184k | 3-year forward projections      |
+| `ml_enrolment_forecast`     | 11    | ~184k | ML-based 3-year projections     |
+
+### Engineering Principles
+
+1. **Zero Python loops** — all row-level computation via SQL
+2. **Window functions** — RANK, PERCENT_RANK, LAG, ROW_NUMBER, cumulative SUM/AVG
+3. **Batched execution** — ~63k rows per year-batch, within Railway limits
+4. **Idempotent** — every engine safe to re-run (DELETE + re-INSERT or overwrite)
+5. **Indexed** — composite indexes on (school_id, academic_year) across all tables
+6. **UDISE+ compliant** — school_category-based norms for classrooms and PTR
+7. **Policy-explainable** — every score, flag, and decision traceable to formula
+
+---
+
+## Phase 11 — ML-Based Enrolment Forecasting Engine
+
+### Objective
+
+Replace Phase 10's weighted moving-average (WMA) with a cross-school
+GradientBoostingRegressor that learns non-linear enrolment dynamics
+from ~300 k training samples across all schools and years.
+
+### Why ML Over Per-School ARIMA
+
+With only 7 annual data points per school, a per-school ARIMA(1,1,0)
+is essentially computing a differenced trend line. A cross-school
+Gradient Boosting model trains on ~300 k+ samples and captures:
+
+- District-level demographic shifts
+- Management-type effects on retention
+- Non-linear interactions (gaps × school-type → enrolment change)
+- Momentum / mean-reversion patterns across the full panel
+- Feature importance insights for policy explanation
+
+### Model Architecture
+
+| Component     | Detail                                                 |
+| ------------- | ------------------------------------------------------ |
+| Algorithm     | sklearn GradientBoostingRegressor                      |
+| Loss          | Huber (robust to outlier growth)                       |
+| Target        | Growth rate: (next − current) / current, clipped ±0.30 |
+| Features      | 20 features (see below)                                |
+| Trees         | 500 (early-stop @ 30 no-change)                        |
+| Depth         | 4, min_samples_leaf=100                                |
+| Learning rate | 0.03                                                   |
+| Subsample     | 0.8                                                    |
+| Train filter  | Schools with enrolment ≥ 10                            |
+| Projection    | Compound: base × (1 + g_ml)^k for k=1,2,3              |
+| Calibration   | Post-prediction bias correction to training mean       |
+
+### Feature Set (20 features)
+
+| Feature                 | Type        | Source                                 |
+| ----------------------- | ----------- | -------------------------------------- |
+| total_enrolment         | Numeric     | yearly_metrics                         |
+| enrolment_lag1, lag2    | Numeric     | Shifted enrolment                      |
+| growth_rate             | Numeric     | (current − lag1) / lag1, clipped ±0.30 |
+| growth_rate_lag1        | Numeric     | Previous year's growth, clipped        |
+| school_category         | Categorical | schools                                |
+| total_teachers          | Numeric     | teacher_metrics                        |
+| total_class_rooms       | Numeric     | infrastructure_details                 |
+| usable_class_rooms      | Numeric     | infrastructure_details                 |
+| classroom_gap           | Numeric     | Phase 2 computed                       |
+| teacher_gap             | Numeric     | Phase 3 computed                       |
+| risk_score              | Numeric     | Phase 4 computed                       |
+| teacher_deficit_ratio   | Numeric     | Phase 4 computed                       |
+| classroom_deficit_ratio | Numeric     | Phase 4 computed                       |
+| district_code           | Encoded     | LabelEncoder(district)                 |
+| management_code         | Encoded     | LabelEncoder(management_type)          |
+| enrolment_3yr_mean      | Numeric     | Rolling 3-year mean                    |
+| enrolment_volatility    | Numeric     | Rolling 3-year std, capped at 500      |
+| teacher_per_student     | Numeric     | teachers / enrolment                   |
+| rooms_per_student       | Numeric     | usable_rooms / enrolment               |
+
+### Feature Importance (Top 10)
+
+| Feature              | Importance | Insight                                            |
+| -------------------- | ---------- | -------------------------------------------------- |
+| enrolment_volatility | 0.3974     | Volatile schools have predictable decline patterns |
+| risk_score           | 0.1180     | Higher risk → different growth trajectory          |
+| total_class_rooms    | 0.1178     | Infrastructure capacity affects retention          |
+| enrolment_lag1       | 0.0798     | Previous enrolment level matters                   |
+| growth_rate_lag1     | 0.0781     | Growth momentum effect                             |
+| growth_rate          | 0.0769     | Current growth trajectory                          |
+| management_code      | 0.0464     | Govt vs private affects retention                  |
+| teacher_per_student  | 0.0333     | Better ratios → better retention                   |
+| enrolment_lag2       | 0.0205     | 2-year-ago context                                 |
+| rooms_per_student    | 0.0098     | Space adequacy signal                              |
+
+### Train / Test Split
+
+- Temporal: train on 2018-19 → 2022-23 transitions (302,774 samples, enrolment ≥ 10)
+- Test on 2023-24 → 2024-25 transition (60,626 samples)
+
+### Performance (ML vs Phase 10 WMA)
+
+| Metric                | ML (GBR)  | Phase 10 (WMA) |
+| --------------------- | --------- | -------------- |
+| Enrolment R² (test)   | **0.926** | 0.903          |
+| Enrolment MAE (test)  | **55**    | 56             |
+| Enrolment MAPE (test) | 38.71%    | 30.27%         |
+| Growth R² (train)     | 0.623     | —              |
+
+- ML beats WMA on R² (+2.5%) and MAE (−1 student)
+- MAPE is higher because ML is worse on very small schools (relative error amplified)
+- At the aggregate / district level ML produces tighter, more realistic gap forecasts
+
+### Projection Results
+
+| Horizon | ML cr_gap | Phase 10 cr_gap | Δ       | ML tr_gap | Phase 10 tr_gap | Δ       |
+| ------- | --------- | --------------- | ------- | --------- | --------------- | ------- |
+| T+1     | 198,342   | 200,719         | −2,377  | 203,766   | 209,829         | −6,063  |
+| T+2     | 207,348   | 218,586         | −11,238 | 212,437   | 232,862         | −20,425 |
+| T+3     | 220,546   | 247,764         | −27,218 | 225,872   | 268,040         | −42,168 |
+
+ML projections grow more conservatively (mean growth −0.023 vs WMA's implicit −0.15),
+producing smaller gap forecasts at T+2 and T+3.
+
+### Design Decisions
+
+1. **Growth rate target (not absolute enrolment)**: Tree-based models can't learn
+   the identity function (next ≈ current). Predicting the growth rate and
+   compounding produces more stable results.
+
+2. **Clipped features & target (±0.30)**: The raw growth distribution has
+   std=0.70 with heavy right skew (school mergers, data errors). Clipping
+   to ±0.30 matches Phase 10's cap and removes outlier influence.
+
+3. **Compound projection (no autoregression)**: Feeding inflated T+1
+   predictions back creates positive feedback loops (+70% growth). Compound
+   projection uses one growth prediction for all horizons: base × (1+g)^k.
+
+4. **Bias calibration**: Post-prediction shift ensures the forecast mean
+   matches training data mean, preventing systematic over/under-prediction.
+
+5. **Training filter (enrolment ≥ 10)**: Schools with <10 students have
+   noise-dominated growth rates that degrade model quality.
+
+6. **Huber loss**: Robust to remaining outliers in the clipped distribution,
+   less sensitive to extreme residuals than MSE.
+
+### Table Schema
+
+| Column                   | Type        | Computation                              |
+| ------------------------ | ----------- | ---------------------------------------- |
+| school_id                | VARCHAR(50) | From schools table                       |
+| base_year                | VARCHAR(20) | 2024-25                                  |
+| forecast_year            | VARCHAR(20) | 2025-26 / 2026-27 / 2027-28              |
+| years_ahead              | INT         | 1, 2, or 3                               |
+| base_enrolment           | INT         | Enrolment in base year                   |
+| ml_growth_rate           | FLOAT       | ML-predicted growth rate (clipped ±0.30) |
+| projected_enrolment      | INT         | base × (1 + g_ml)^years_ahead            |
+| projected_classrooms_req | INT         | CEILING(projected / cr_norm)             |
+| projected_teachers_req   | INT         | CEILING(projected / ptr_norm)            |
+| current_classrooms       | INT         | Current usable classrooms                |
+| current_teachers         | INT         | Current total teachers                   |
+| projected_classroom_gap  | INT         | MAX(0, required − current)               |
+| projected_teacher_gap    | INT         | MAX(0, required − current)               |
+| school_category          | INT         | UDISE+ category code                     |
+| model_version            | VARCHAR(20) | 'v1.0'                                   |
+
+### Indexing
+
+| Index Name       | Table                 | Purpose              |
+| ---------------- | --------------------- | -------------------- |
+| idx_ml_fc_school | ml_enrolment_forecast | School + year lookup |
+| idx_ml_fc_year   | ml_enrolment_forecast | Horizon filtering    |
+
+### Script Location
+
+`engines/ml_forecasting_engine.py`
+
+### Current Status
+
+✔ 20-feature GradientBoostingRegressor with huber loss
+✔ Temporal train/test split (302k train, 60k test)
+✔ Growth rate target clipped to ±0.30
+✔ Feature clipping to prevent out-of-distribution extrapolation
+✔ Post-prediction bias calibration
+✔ Compound projection (no autoregressive divergence)
+✔ R² = 0.926, MAE = 55 (beats Phase 10 WMA)
+✔ Realistic growth forecasts (mean −0.023)
+✔ Feature importance for policy explanation
+✔ 183,951 forecast rows written (61,317 schools × 3 horizons)
+✔ Idempotent — safe to re-run

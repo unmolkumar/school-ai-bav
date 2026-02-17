@@ -114,3 +114,107 @@ Phase 4 – Composite Compliance Risk Engine
 - Idempotent — safe to re-run; always overwrites computed columns
 - Phase 2 (classroom gap) and Phase 3 (teacher gap) logic unchanged
 - Updated ai.md with full policy justification and formula documentation
+
+---
+
+Phase 5 – School Prioritisation Engine
+
+- Created school_priority_index table (one row per school per year)
+- State-wide ranking via RANK() OVER (ORDER BY risk_score DESC)
+- District-level ranking via RANK() OVER (PARTITION BY district)
+- Priority bucketing via PERCENT_RANK() — TOP_5 / TOP_10 / TOP_20 / STANDARD
+- Persistent high-risk detection via LAG() — flags schools with 3+ consecutive HIGH/CRITICAL years
+- Batched INSERT per academic year (~63k rows/batch)
+- Added idx_priority_school_year index
+- All computation server-side — no Python row loops
+- Idempotent — safe to re-run
+- Verified: 437,106 rows; 10,588 persistent high-risk; 22,195 Top 5%
+- Updated ai.md with Phase 5 documentation
+
+---
+
+Phase 6 – Budget Allocation Simulator
+
+- Created budget_simulation table
+- Seeds classroom_gap + teacher_gap from infrastructure_details + teacher_metrics
+- Priority ordering via ROW_NUMBER() — CRITICAL → HIGH → MODERATE → LOW
+- Cumulative SUM() OVER() for budget cutoff allocation
+- Configurable budget: default ₹50Cr classroom (1,000 rooms @ ₹5L), 10,000 teacher posts
+- Tracks classroom_resolved / teacher_resolved per school
+- Added idx_budget_school_year and idx_budget_priority indexes
+- Batched per academic year
+- All computation server-side — no Python row loops
+- Idempotent — safe to re-run
+- Verified: 7,000 classrooms allocated, 70,000 teachers allocated across 7 years
+- Updated ai.md with Phase 6 documentation
+
+---
+
+Phase 7 – Longitudinal Risk Trend Engine
+
+- Created risk_trend table (one row per school per year)
+- Risk delta via LAG(risk_score, 1) across full time series
+- Trend classification: IMPROVING (<-0.10) / STABLE / DETERIORATING (>+0.10) / BASELINE
+- Chronic risk flag: 3+ consecutive HIGH/CRITICAL years (via LAG on risk_level)
+- Volatile flag: |risk_delta| > 0.25 in current or previous transition
+- Running cumulative average risk via AVG() OVER (ROWS UNBOUNDED PRECEDING)
+- Full longitudinal INSERT (all years in single pass for correct LAG windows)
+- Chronic + volatile flags batched per year
+- Added idx_trend_school_year and idx_trend_direction indexes
+- All computation server-side — no Python row loops
+- Idempotent — safe to re-run
+- Verified: 437,106 rows; 123,487 improving, 75,875 deteriorating, 10,588 chronic
+- Updated ai.md with Phase 7 documentation
+
+---
+
+Phase 8 – District Compliance Index
+
+- Created district_compliance_index table (one row per district per year)
+- Aggregated: total_schools, avg_risk_score, pct_high_critical, total deficits, total enrolment
+- Compliance grading: A (≤0.15) / B (≤0.30) / C (≤0.50) / D (≤0.75) / F (>0.75)
+- YoY risk improvement via LAG() on own table
+- District ranking via RANK() per year
+- Added idx_dci_district_year and idx_dci_rank indexes
+- Batched per academic year
+- All computation server-side — no Python row loops
+- Idempotent — safe to re-run
+- Verified: 182 records (26 districts × 7 years); KURNOOL #1 risk (0.3828, Grade C)
+- Updated ai.md with Phase 8 documentation
+
+---
+
+Phase 9 – Proposal Validation Engine
+
+- Created school_demand_proposals table (synthetic proposals with CRC32 noise)
+- Created proposal_validations table (validated output with decisions)
+- CRC32-based deterministic noise (0.7–1.5×) for reproducible proposal simulation
+- Multi-dimensional validation against actual classroom_gap and teacher_gap
+- Three-tier decision: ACCEPTED / FLAGGED / REJECTED
+- Confidence scoring: max(0, 1 − (|1 − cr_ratio| + |1 − tr_ratio|) / 2)
+- Reason codes: WITHIN_TOLERANCE, NO_REQUEST, NO_DEFICIT, _\_OVER_REQUEST, _\_UNDER_REQUEST
+- Added idx_proposals_school_year, idx_validations_school_year, idx_validations_decision
+- Batched per academic year
+- All computation server-side — no Python row loops
+- Idempotent — safe to re-run
+- Verified: 437,106 proposals; 325,758 ACCEPTED, 111,348 FLAGGED; avg confidence 0.916
+- Updated ai.md with Phase 9 documentation
+
+---
+
+Phase 10 – Enrolment Forecasting Engine
+
+- Created enrolment_forecast table (3 rows per school — T+1, T+2, T+3)
+- Weighted 3-year moving average growth rate via LAG() across full time series
+- Growth capped at ±0.30 to filter administrative anomalies
+- Projection: E(t+n) = E(t) × (1 + growth)^n for n in {1, 2, 3}
+- UDISE+ category-based classroom norms (30/35/40) and PTR norms (30/35)
+- Projected classroom and teacher requirements via CEILING(enrolment / norm)
+- Projected deficits against current capacity: GREATEST(0, required − current)
+- CROSS JOIN with (1, 2, 3) for efficient multi-horizon generation
+- Added idx_forecast_school and idx_forecast_year indexes
+- All computation server-side — no Python row loops
+- Idempotent — safe to re-run
+- Verified: 183,951 forecast rows (61,317 schools × 3); base 2024-25 → 2027-28
+- Mean growth: −0.1469; T+3 classroom deficit: 247,764; T+3 teacher deficit: 268,040
+- Updated ai.md with Phase 10 documentation and system architecture summary
